@@ -1,0 +1,31 @@
+{
+  "name": "@ricky/openchamber-pet",
+  "version": "0.1.0",
+  "private": true,
+  "description": "An animated pet on the OpenChamber rail that reacts to what the agents are doing.",
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": {
+      "openchamber": ">=2.7.0"
+    },
+    "id": "ricky-pet",
+    "name": "Pet",
+    "icon": "icon.svg",
+    "contributes": {
+      "panel": {
+        "id": "ricky-pet",
+        "name": "Pet",
+        "icon": "icon.svg",
+        "entry": "panel/index.html"
+      },
+      "capabilities": [
+        "sessions"
+      ]
+    }
+  },
+  "devDependencies": {
+    "@openchamber/sdk": "^2.7.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  }
+}

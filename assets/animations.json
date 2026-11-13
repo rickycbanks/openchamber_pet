@@ -1,0 +1,79 @@
+{
+  "idle": {
+    "row": 0,
+    "startCol": 0,
+    "frames": 6,
+    "fps": 6,
+    "loop": true
+  },
+  "run": {
+    "row": 1,
+    "startCol": 0,
+    "frames": 8,
+    "fps": 12,
+    "loop": true
+  },
+  "runLeft": {
+    "row": 2,
+    "startCol": 0,
+    "frames": 8,
+    "fps": 12,
+    "loop": true
+  },
+  "wave": {
+    "row": 3,
+    "startCol": 0,
+    "frames": 4,
+    "fps": 8,
+    "loop": false
+  },
+  "surprised": {
+    "row": 4,
+    "startCol": 0,
+    "frames": 5,
+    "fps": 8,
+    "loop": true
+  },
+  "curious": {
+    "row": 5,
+    "startCol": 0,
+    "frames": 8,
+    "fps": 8,
+    "loop": true
+  },
+  "excited": {
+    "row": 6,
+    "startCol": 0,
+    "frames": 6,
+    "fps": 10,
+    "loop": true
+  },
+  "happy": {
+    "row": 7,
+    "startCol": 0,
+    "frames": 6,
+    "fps": 8,
+    "loop": false
+  },
+  "blush": {
+    "row": 8,
+    "startCol": 0,
+    "frames": 6,
+    "fps": 8,
+    "loop": false
+  },
+  "glance": {
+    "row": 9,
+    "startCol": 0,
+    "frames": 8,
+    "fps": 6,
+    "loop": true
+  },
+  "worried": {
+    "row": 10,
+    "startCol": 0,
+    "frames": 8,
+    "fps": 8,
+    "loop": true
+  }
+}
