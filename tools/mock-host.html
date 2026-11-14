@@ -1,0 +1,340 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Pet mock host harness</title>
+<style>
+  body { font: 12px/1.5 monospace; margin: 12px; background: #111; color: #ddd; }
+  #panel-frame { width: 320px; height: 560px; border: 1px solid #444; }
+  #log { white-space: pre-wrap; margin-top: 10px; }
+  .pass { color: #6f6; } .fail { color: #f66; }
+</style>
+</head>
+<body>
+<iframe id="panel-frame" src="/panel/index.html"></iframe>
+<div id="log">starting…</div>
+<script>
+// Dev-only mock of the OpenChamber host frame: speaks the guest protocol from
+// @openchamber/sdk (channel 'openchamber.sdk', v 1) and drives scripted
+// session scenarios, logging PASS/FAIL for each expectation.
+const CH = 'openchamber.sdk', V = 1;
+const frame = document.getElementById('panel-frame');
+const logEl = document.getElementById('log');
+const lines = [];
+let failures = 0;
+const log = (ok, text) => { if (!ok) failures++; lines.push((ok ? 'PASS ' : 'FAIL ') + text); logEl.innerHTML = lines.map(l => `<span class="${l.startsWith('PASS') ? 'pass' : 'fail'}">${l}</span>`).join('\n'); };
+const finish = () => log(failures === 0, `OVERALL ${failures === 0 ? 'PASS' : 'FAIL'} (${failures} failure(s))`);
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+const TOKENS = {
+  background: '#1b1b1f', elevated: '#232329', foreground: '#e8e8ec', muted: '#9a9aa5',
+  subtle: '#6d6d78', border: '#33333c', hover: '#2a2a32', selection: '#3b4b6b', focus: '#5b7bd5',
+  primary: '#5b7bd5', mutedSurface: '#26262e', elevatedForeground: '#f2f2f5', active: '#31415f',
+  selectionForeground: '#ffffff', primaryForeground: '#ffffff', primaryText: '#7ea0e8',
+  successText: '#5fbf77', warningText: '#d9a13b', errorText: '#e06c60', infoText: '#6fb3d9',
+  success: '#3f9e57', warning: '#b98a2e', error: '#c0524a', info: '#4d90b8',
+  font: 'system-ui, sans-serif', mono: 'monospace', radius: '8px',
+};
+
+const state = {
+  projects: [{ id: 'p1', name: 'proj-one', directory: '/tmp/proj-one' }],
+  sessions: {}, // projectId -> sessions
+  subs: {},     // subscriptionId -> query
+  badgeLog: [],
+  grant: new URLSearchParams(location.search).get('grant') !== '0',
+  openSession: null,
+  store: {},    // key -> value, emulates persistent host storage
+  preset: new URLSearchParams(location.search).get('scope') === 'current' ? { name: 'Fox', speed: 1, scope: 'current', enabled: true } : null,
+};
+
+const ENV = { channel: CH, v: V };
+const send = (msg) => frame.contentWindow.postMessage(msg, '*');
+const push = (type, payload) => send({ ...ENV, type, payload });
+const result = (id, ok, payload, code, error) => send({ ...ENV, type: 'result', id, ok, ...(payload !== undefined ? { payload } : {}), ...(code ? { code, error } : {}) });
+
+// NOTE: `tool` is a forward-compat field (host > SDK 2.7.0); the strict 2.7.0 session schema omits it. The tool-less step below covers the generic fallback.
+const sess = (id, projectId, activity, extra = {}) => ({
+  id, title: 'session ' + id, projectId, directory: '/tmp/' + projectId,
+  agent: 'coder', parentId: null, createdAt: 1, updatedAt: 2, archivedAt: null,
+  worktree: null, activity, outcome: null, items: [], ...extra,
+});
+
+function pushProjects() {
+  const sub = Object.entries(state.subs).find(([, q]) => q.kind === 'projects');
+  if (sub) push('workspace', { subscriptionId: sub[0], snapshot: { kind: 'projects', state: 'ready', projects: state.projects } });
+}
+function pushSessions(projectId) {
+  for (const [sid, q] of Object.entries(state.subs)) {
+    if (q.kind === 'sessions' && q.projectId === projectId) {
+      push('workspace', { subscriptionId: sid, snapshot: { kind: 'sessions', projectId, state: 'ready', coverage: [], sessions: state.sessions[projectId] || [] } });
+    }
+  }
+}
+
+window.addEventListener('message', (event) => {
+  if (event.source !== frame.contentWindow) return;
+  const m = event.data;
+  if (!m || m.channel !== CH) return;
+  if (m.type === 'hello') {
+    push('ready', {
+      theme: { mode: 'dark', tokens: TOKENS }, locale: 'en', directory: '/tmp/proj-one',
+      session: state.openSession, surface: 'panel',
+      connection: { connected: true, account: 'local' }, settings: {}, item: null,
+    });
+    return;
+  }
+  if (m.type === 'workspace-subscribe') {
+    if (!state.grant) { result(m.id, false, undefined, 'NOT_GRANTED', 'capability not approved'); return; }
+    state.subs[m.payload.subscriptionId] = m.payload.query;
+    result(m.id, true); // void ack: payload omitted per the wire schema
+    if (m.payload.query.kind === 'projects') pushProjects();
+    else if (m.payload.query.kind === 'sessions') pushSessions(m.payload.query.projectId);
+    return;
+  }
+  if (m.type === 'workspace-unsubscribe') { delete state.subs[m.payload.subscriptionId]; result(m.id, true); return; }
+  if (m.type === 'storage') {
+    if (m.payload.op === 'get') {
+      const has = Object.prototype.hasOwnProperty.call(state.store, m.payload.key);
+      const found = has || (state.preset && m.payload.key === 'pet-settings');
+      const value = has ? state.store[m.payload.key] : state.preset;
+      result(m.id, true, found ? { storage: true, op: 'get', found: true, value } : { storage: true, op: 'get', found: false });
+    } else if (m.payload.op === 'set') {
+      state.store[m.payload.key] = m.payload.value;
+      result(m.id, true, { storage: true, op: 'set' });
+    } else {
+      result(m.id, true, { storage: true, op: m.payload.op });
+    }
+    return;
+  }
+  if (m.type === 'badge') { state.badgeLog.push(m.payload.count); result(m.id, true); return; }
+  if (m.id) result(m.id, true);
+});
+
+const pet = () => frame.contentWindow.__pet;
+const status = () => frame.contentDocument.querySelector('#status').textContent;
+const anim = () => pet() ? pet().player.name + (pet().player.oneshot ? '*' : '') : '(none)';
+const expect = async (label, wantAnim, wantStatusPart) => {
+  await sleep(120);
+  const a = anim(), s = status();
+  const okA = wantAnim === null || a === wantAnim;
+  const okS = !wantStatusPart || s.includes(wantStatusPart);
+  log(okA && okS, `${label}: anim=${a} status="${s}" (want anim=${wantAnim ?? 'any'} status~${wantStatusPart ?? 'any'})`);
+};
+// like expect(), but polls — one-shots may be queued behind another one-shot or
+// held by MIN_DISPLAY_MS, so a single fixed-delay sample can miss them
+const waitExpect = async (label, wantAnim, wantStatusPart, timeout = 3000) => {
+  const t0 = Date.now();
+  let a = '', s = '';
+  let okA = false, okS = false;
+  while (Date.now() - t0 < timeout) {
+    await sleep(100);
+    a = anim(); s = status();
+    okA = wantAnim === null || a === wantAnim;
+    okS = !wantStatusPart || s.includes(wantStatusPart);
+    if (okA && okS) break;
+  }
+  log(okA && okS, `${label}: anim=${a} status="${s}" (want anim=${wantAnim ?? 'any'} status~${wantStatusPart ?? 'any'})`);
+};
+// polls the panel's requestAnim debug log for a one-shot request — deterministic even
+// if headless rAF bursts make the one-shot frames advance faster than wall-clock polls
+const waitAnimLog = async (label, from, needle, timeout = 3000) => {
+  const t0 = Date.now();
+  let hit = false;
+  while (Date.now() - t0 < timeout) {
+    await sleep(100);
+    hit = !!pet() && pet().animLog.slice(from).some((e) => e.includes(needle));
+    if (hit) break;
+  }
+  const p = pet();
+  log(hit, `${label}: ${hit ? `saw "${needle}" requested` : `no "${needle}" from=${from} slice=${JSON.stringify(p ? p.animLog.slice(from) : [])} full=${JSON.stringify(p ? p.animLog : [])} ts=${JSON.stringify(p ? p.lastOutcome : [])} fl=${JSON.stringify(p ? p.flashed : [])} q=${JSON.stringify(p ? p.outcomeQueue : [])}`}`);
+};
+
+let round = 0;
+frame.addEventListener('load', async () => {
+  round++;
+  await sleep(400);
+  try {
+    if (!state.grant) {
+      // capability not approved -> friendly empty state, no crash
+      await sleep(400);
+      const emptyVisible = !frame.contentDocument.querySelector('#empty').hidden;
+      const st = frame.contentDocument.querySelector('#status').textContent;
+      log(emptyVisible && st.includes('sessions capability'), `not-granted empty state: empty=${emptyVisible} status="${st}"`);
+      return finish();
+    }
+    if (round === 2) {
+      // after the settings save + iframe reload: the persisted pet name must come back
+      const s = status();
+      log(s.includes('Rusty'), `persisted name after reload: status="${s}"`);
+      return finish();
+    }
+
+    if (state.preset) {
+      // scope=current: the open idle session wins; a background project's running
+      // activity and failure outcome must NOT drive the pet
+      state.sessions.p1 = [sess('s1', 'p1', 'idle')];
+      pushSessions('p1');
+      push('session', { session: { id: 's1', title: 'session s1', busy: false, agent: 'coder' } });
+      state.openSession = { id: 's1', title: 'session s1', busy: false, agent: 'coder' };
+      await sleep(300);
+      state.projects.push({ id: 'p2', name: 'proj-two', directory: '/tmp/proj-two' });
+      pushProjects();
+      await sleep(200);
+      state.sessions.p2 = [sess('s9', 'p2', 'running', { tool: { name: 'bash', target: 'make' } })];
+      pushSessions('p2');
+      await sleep(1700);
+      await expect('current scope ignores background run', 'idle', 'proj-one');
+      const markS = pet() ? pet().animLog.length : 0;
+      push('session-lifecycle', { sessionId: 's9', phase: 'failure' });
+      state.sessions.p2 = [sess('s9', 'p2', 'idle', { outcome: 'failed' })];
+      pushSessions('p2');
+      await sleep(1500);
+      const sawSad = pet() && pet().animLog.slice(markS).some((e) => e.includes('1shot:worried'));
+      log(!sawSad, `current scope suppresses background failure one-shot (saw worried: ${sawSad})`);
+      return finish();
+    }
+
+    // 1. boot: no sessions yet -> idle
+    await expect('boot idle', 'idle', 'idle');
+
+    // 2. project p1 with an idle session
+    state.sessions.p1 = [sess('s1', 'p1', 'idle')];
+    pushSessions('p1');
+    push('session', { session: { id: 's1', title: 'session s1', busy: false, agent: 'coder' } });
+    state.openSession = { id: 's1', title: 'session s1', busy: false, agent: 'coder' };
+    await expect('idle session', 'idle', 'watching');
+
+    // 3. running bash -> run
+    state.sessions.p1 = [sess('s1', 'p1', 'running', { tool: { name: 'bash', target: 'npm test' } })];
+    pushSessions('p1');
+    await sleep(1700); // outlast MIN_DISPLAY_MS
+    await expect('running bash', 'run', 'bash');
+
+    // 4. running read -> curious
+    state.sessions.p1 = [sess('s1', 'p1', 'running', { tool: { name: 'read', target: 'src/main.ts' } })];
+    pushSessions('p1');
+    await sleep(1700);
+    await expect('running read', 'curious', 'read');
+
+    // 5. running edit -> excited
+    state.sessions.p1 = [sess('s1', 'p1', 'running', { tool: { name: 'edit', target: 'src/main.ts' } })];
+    pushSessions('p1');
+    await sleep(1700);
+    await expect('running edit', 'excited', 'edit');
+
+    // 5b. running with no tool info (SDK 2.7.0 shape) -> generic working animation
+    state.sessions.p1 = [sess('s1', 'p1', 'running')];
+    pushSessions('p1');
+    await sleep(1700);
+    await expect('running without tool', 'excited', 'watching');
+
+    // 6. waiting-permission -> surprised + badge 1
+    state.sessions.p1 = [sess('s1', 'p1', 'waiting-permission')];
+    pushSessions('p1');
+    await sleep(1700);
+    await expect('waiting permission', 'surprised', 'permission');
+    log(state.badgeLog.includes(1), `badge saw 1 (log: ${JSON.stringify(state.badgeLog)})`);
+
+    // 7. retrying -> worried
+    state.sessions.p1 = [sess('s1', 'p1', 'retrying')];
+    pushSessions('p1');
+    await sleep(1700);
+    await expect('retrying', 'worried', 'retrying');
+
+    // 8. lifecycle completed on open session -> happy one-shot, then idle
+    state.sessions.p1 = [sess('s1', 'p1', 'idle', { outcome: 'completed' })];
+    const mark8 = pet() ? pet().animLog.length : 0;
+    push('session-lifecycle', { sessionId: 's1', phase: 'completed' });
+    pushSessions('p1');
+    await waitAnimLog('completed one-shot requested', mark8, '1shot:happy');
+    await waitExpect('completed one-shot', 'happy*', 'happy');
+    await sleep(1200);
+    await expect('back to loop after one-shot', 'idle', null);
+
+    // 9. second project running while first idle -> follows the running one
+    state.projects.push({ id: 'p2', name: 'proj-two', directory: '/tmp/proj-two' });
+    pushProjects();
+    await sleep(200);
+    state.sessions.p2 = [sess('s9', 'p2', 'running', { tool: { name: 'bash', target: 'make' } })];
+    pushSessions('p2');
+    await sleep(1700);
+    await expect('follows running project', 'run', 'proj-two');
+
+    // 10. lifecycle failure -> worried one-shot
+    const mark10 = pet() ? pet().animLog.length : 0;
+    push('session-lifecycle', { sessionId: 's9', phase: 'failure' });
+    state.sessions.p2 = [sess('s9', 'p2', 'idle', { outcome: 'failed' })];
+    pushSessions('p2');
+    await waitAnimLog('failed one-shot requested', mark10, '1shot:worried');
+    await waitExpect('failed one-shot', 'worried*', 'sad');
+
+    // 11. no session open, all idle -> idle
+    push('session', { session: null });
+    state.openSession = null;
+    state.sessions.p1 = [sess('s1', 'p1', 'idle')];
+    state.sessions.p2 = [sess('s9', 'p2', 'idle')];
+    pushSessions('p1'); pushSessions('p2');
+    await sleep(1700);
+    await expect('all idle', 'idle', null);
+
+    // 11b. duplicate outcome signals for the same turn must not replay the one-shot
+    push('session-lifecycle', { sessionId: 's1', phase: 'completed' });
+    state.sessions.p1 = [sess('s1', 'p1', 'idle', { outcome: 'completed' })];
+    pushSessions('p1');
+    await sleep(1700);
+    await expect('no duplicate one-shot for same turn', 'idle', null);
+
+    // 11c. a new turn (lifecycle started + running) resets outcome memory -> celebrates again
+    push('session-lifecycle', { sessionId: 's1', phase: 'started' });
+    state.sessions.p1 = [sess('s1', 'p1', 'running', { tool: { name: 'bash', target: 'make' } })];
+    pushSessions('p1');
+    await sleep(1700);
+    await expect('new turn running', 'run', null);
+    const mark11c = pet() ? pet().animLog.length : 0;
+    push('session-lifecycle', { sessionId: 's1', phase: 'completed' });
+    state.sessions.p1 = [sess('s1', 'p1', 'idle', { outcome: 'completed' })];
+    pushSessions('p1');
+    await waitAnimLog('second completion celebrates again', mark11c, '1shot:happy');
+    await sleep(1200);
+    await expect('settles back to idle', 'idle', null);
+
+    // 11d. an outcome arriving while another one-shot plays is queued, not lost
+    const mark11d = pet() ? pet().animLog.length : 0;
+    push('session-lifecycle', { sessionId: 's1', phase: 'started' }); // wave starts
+    await sleep(150);
+    push('session-lifecycle', { sessionId: 's9', phase: 'started' }); // new turn for s9
+    push('session-lifecycle', { sessionId: 's9', phase: 'failure' }); // background failure during wave
+    state.sessions.p2 = [sess('s9', 'p2', 'idle', { outcome: 'failed' })];
+    pushSessions('p2');
+    await expect('wave still playing', 'wave*', null);
+    await waitAnimLog('queued failure plays after wave', mark11d, '1shot:worried');
+
+    // 12. disconnected banner
+    push('connection', { connection: { connected: false, account: 'local' } });
+    await sleep(200);
+    const bannerVisible = !frame.contentDocument.querySelector('#banner-slot').hidden;
+    log(bannerVisible, 'disconnected banner shown');
+    push('connection', { connection: { connected: true, account: 'local' } });
+
+    // 13. settings: name change is live, then persisted (debounced 250ms) across a reload
+    const nameInput = frame.contentDocument.querySelector('#settings input');
+    log(!!nameInput, 'settings field mounted');
+    if (nameInput) {
+      nameInput.value = 'Rusty';
+      nameInput.dispatchEvent(new Event('input', { bubbles: true }));
+      nameInput.dispatchEvent(new Event('change', { bubbles: true }));
+      await sleep(700); // outlast the 250ms save debounce
+      const s = status();
+      log(s.includes('Rusty'), `name change applied live: status="${s}"`);
+      frame.src = '/panel/index.html?r=2'; // reload -> round 2 verifies persistence
+      return; // the load handler runs again as round 2
+    }
+    finish();
+  } catch (e) {
+    log(false, 'harness error: ' + (e && e.message));
+    finish();
+  }
+});
+</script>
+</body>
+</html>

@@ -45,10 +45,27 @@ icon.svg              # rail icon (paw)
 assets/spritesheet.png
 assets/animations.json  # name → { row, startCol, frames, fps, loop, flip? }
 tools/slice.py        # verifies the 8×11 grid, occupancy, writes a contact sheet
+tools/mock-host.html  # dev-only mock host + scenario harness (PASS/FAIL log)
 panel/index.html      # canvas + status + settings shell
 panel/main.ts         # source
 panel/main.js         # built IIFE (committed)
 ```
+
+## Verification (headless)
+
+`tools/mock-host.html` emulates the OpenChamber host frame (the real SDK wire
+protocol from `@openchamber/sdk`) inside an iframe that loads `panel/index.html`,
+then drives scripted session scenarios and logs PASS/FAIL:
+
+```bash
+cd /var/home/ricky/Projects/openchamber_pet
+python3 -m http.server 8734 --bind 127.0.0.1 &
+# open http://127.0.0.1:8734/tools/mock-host.html in a browser and read the log
+# (?grant=0 exercises the NOT_GRANTED empty state)
+```
+
+The panel exposes a `window.__pet` debug handle (player state, settings, derive,
+animation request log) used by the harness assertions.
 
 ## Asset credit
 

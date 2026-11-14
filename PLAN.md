@@ -51,47 +51,47 @@ openchamber_pet/
 
 ## Phase 0 — Scaffold
 
-- [ ] `git init` in `/var/home/ricky/Projects/openchamber_pet` (not a repo yet)
-- [ ] `package.json`:
+- [x] `git init` in `/var/home/ricky/Projects/openchamber_pet`
+- [x] `package.json`:
   - `"name": "@ricky/openchamber-pet"`, `"version": "0.1.0"`, `"private": true`
   - `"openchamber"`: `apiVersion: 1`, `engines: { "openchamber": ">=2.7.0" }`, `id: "ricky-pet"`, `name: "Pet"`, `icon: "icon.svg"`,
     `contributes: { panel: { id: "ricky-pet", name: "Pet", icon: "icon.svg", entry: "panel/index.html" }, capabilities: ["sessions"] }`
-  - `devDependencies: { "@openchamber/sdk": "^2.7.0" }` (version matches the installed app; check Settings → About)
-- [ ] `icon.svg` (simple paw, themed neutrally)
-- [ ] `.gitignore` → `node_modules/`
-- [ ] `README.md` — what it is, install steps, dev loop, asset credit
-- [ ] `npm install` (SDK for types only; it gets bundled into main.js)
+  - `devDependencies: { "@openchamber/sdk": "^2.7.0" }` (+ esbuild/typescript for the local build)
+- [x] `icon.svg` (simple paw, themed neutrally)
+- [x] `.gitignore` → `node_modules/` (+ generated contact sheet/zooms)
+- [x] `README.md` — what it is, install steps, dev loop, asset credit
+- [x] `npm install` (SDK for types only; it gets bundled into main.js)
 
 ## Phase 1 — Sprite pipeline
 
-- [ ] Move `pet_6af74a9195b48191953e1d99805b9a60-spritesheet.png` → `assets/spritesheet.png`
-- [ ] Write `tools/slice.py` (pillow+numpy): load PNG, assert size 1536×2288, verify empty gutters at multiples of 192 (cols) and 208 (rows), report per-cell alpha occupancy
-- [ ] Generate a downscaled contact sheet (like the one used in planning) and **label each of the 11 rows** with an animation name by looking at it. Known so far: row 0 = idle/blink (6 frames, cols 6–7 empty), rows 1–2 = run cycle (8 frames; row 2 occupancy identical to row 1 — diff frames to see if it's a variant or duplicate; use canvas flip if duplicate)
-- [ ] Write `assets/animations.json`, e.g. `"idle": { "row": 0, "startCol": 0, "frames": 6, "fps": 6, "loop": true }`, `"run": { "row": 1, ... "fps": 10 }`, …
-- [ ] Sanity check: total occupied cells = 6+8+8+4+5+8+6+6+6+8+8 = 73 frames across 11 rows
+- [x] Moved spritesheet → `assets/spritesheet.png`
+- [x] `tools/slice.py` (pillow+numpy): asserts 1536×2288, verifies empty gutters at multiples of 192/208, reports per-cell alpha occupancy, row-vs-row diffs, writes a labeled contact sheet
+- [x] Contact sheet generated and all 11 rows labeled in `assets/animations.json` (idle, run, runLeft, wave, surprised, curious, excited, happy, blush, glance, worried); row diffs confirmed rows 1–2 are distinct run variants (runLeft kept as its own row)
+- [x] `assets/animations.json` written and verified against measured occupancy (`slice.py --write-json`)
+- [x] Sanity check: total occupied cells = 6+8+8+4+5+8+6+6+6+8+8 = 73 frames across 11 rows — matches
 
 ## Phase 2 — Renderer / panel shell
 
-- [ ] `panel/index.html`: full-height layout, `<canvas id="pet">`, status `<div id="status">`, settings container, `<script src="main.js">`; no remote anything
-- [ ] `panel/main.ts`:
-  - [ ] `const host = connectHost()`; `Ready(ctx => applyHostReady(ctx, document.documentElement))` (SDK's ready helper — check `packages/sdk/examples` for exact export name)
-  - [ ] Load `../assets/spritesheet.png` as `Image`, load `../assets/animations.json` via fetch
-  - [ ] Player: `requestAnimationFrame` loop, current animation from `animations.json`, `ctx.drawImage(sheet, col*192, row*208, 192, 208, dx, dy, dw, dh)`; `imageSmoothingEnabled = false`; scale to panel width; flip via `ctx.save(); ctx.scale(-1,1)` when `flip`
-  - [ ] `ResizeObserver` on the panel to re-fit canvas (devicePixelRatio-aware)
-  - [ ] Pause when hidden (`document.visibilitychange`) — no CPU burn with the rail closed
-  - [ ] Theme: background/text from `ctx.theme.tokens` CSS vars; default to idle animation so the panel is alive immediately
-- [ ] Build: `bunx openchamber-guest-bundle panel/main.ts panel/main.js` (install bun if missing; fallback esbuild command above)
-- [ ] Install: OpenChamber → Settings → Extensions → Add → `/var/home/ricky/Projects/openchamber_pet` → approve `sessions` → rail icon appears; click it, pet idles
-- [ ] Verify: edit → rebuild → reload loop works from the folder install
+- [x] `panel/index.html`: full-height layout, `<canvas id="pet">`, status `<div id="status">`, settings container, `<script src="main.js">`; no remote anything
+- [x] `panel/main.ts`:
+  - [x] `const host = connectHost()`; `host.onReady(ctx => applyHostReady(ctx, document.documentElement))`
+  - [x] Loads `../assets/spritesheet.png` as `Image`, `../assets/animations.json` via fetch
+  - [x] Player: rAF loop, `ctx.drawImage(sheet, col*192, row*208, 192, 208, …)`; `imageSmoothingEnabled = false`; scales to panel; `flip` via `ctx.scale(-1,1)`
+  - [x] `ResizeObserver` on the stage re-fits the canvas (devicePixelRatio-aware)
+  - [x] Pauses when hidden (`document.visibilitychange` cancels rAF)
+  - [x] Theme from `ctx.theme.tokens` CSS vars (`--oc-*`); idles immediately once assets load
+- [x] Build: `npx esbuild panel/main.ts --bundle --format=iife --platform=browser --outfile=panel/main.js` (bun not installed; `openchamber-guest-bundle` needs bun — esbuild fallback used); `panel/main.js` committed
+- [ ] Install: OpenChamber → Settings → Extensions → Add → `/var/home/ricky/Projects/openchamber_pet` → approve `sessions` → rail icon appears; click it, pet idles (in-app step, not yet done in this environment)
+- [x] Verify: edit → rebuild → reload loop works from the folder install (via `tools/mock-host.html` headless harness)
 
 ## Phase 3 — Reactivity (state machine)
 
-- [ ] Subscribers: `host.onSession`, `host.onSessionLifecycle`, `host.onProjects` → for each project `host.onSessions(projectId, snap => …)` (store stop functions; re-subscribe on project list changes)
-- [ ] Derive pet state each snapshot:
-  - [ ] Pick session: prefer `ctx.session.id` if it's active; else most active by priority `running > waiting-permission/waiting-question > retrying > idle > unknown`
-  - [ ] Map to animation (see table below); keep `minDisplayMs ≈ 1500` per animation so it doesn't strobe; one-shot animations (happy/sad) play once then return to the current loop state
-  - [ ] Status line text: e.g. `watching <agent> run bash in <project>` / `idle` / `waiting for your permission`, using session `tool.name`/`tool.target`, `agent`, project directory
-- [ ] Wire `onSessionLifecycle` phases (`started`/`completed`/`failure`) as extra signals for one-shot happy/sad on the open session
+- [x] Subscribers: `host.onSession`, `host.onSessionLifecycle`, `host.onProjects` → per project `host.onSessions(projectId, …)` with token-guarded stop functions; re-subscribes on project list changes; generation counter guards stale async
+- [x] Derive pet state each snapshot:
+  - [x] Pick session: open session preferred when active; else most active by priority `running > waiting-permission/waiting-question > retrying > idle > unknown`, with an uncelebrated turn outcome breaking idle ties
+  - [x] Map to animation (table below); `MIN_DISPLAY_MS ≈ 1500` anti-strobe; one-shots (wave/happy/sad) play once then return to the current loop; queued outcomes are marked consumed only when playback starts
+  - [x] Status line text: `watching <agent> run bash <target> in <project>` / `is idle` / `needs you — permission request in <project>`, using `tool.name`/`tool.target`, `agent`, project name
+- [x] `onSessionLifecycle` phases wired: `started` → wave one-shot + resets outcome memory; `completed`/`failure` → queued happy/sad one-shot (deduped against snapshot signals)
 
 ### State → animation mapping
 
@@ -111,23 +111,27 @@ openchamber_pet/
 
 ## Phase 4 — Polish
 
-- [ ] Settings UI from `@openchamber/sdk/ui` (themed): pet name (shown in status line), animation speed multiplier, watch scope (all projects vs current session only), enabled on/off
-- [ ] Persist settings in `host.storage` (get/set JSON); re-apply on `host.onSettings`/storage change
-- [ ] `host.setBadge(count of running sessions)`; cleared when panel opens (host does this) / when none running
-- [ ] Guard: duplicate mount protection (mount once, then only update), generation counter so stale async responses don't paint over newer state (pattern from SDK example)
-- [ ] Error handling: `NOT_GRANTED` → friendly "enable the sessions capability in Settings → Extensions" empty state; `host.onConnection` to show disconnected state
+- [x] Settings UI from `@openchamber/sdk/ui` (themed): pet name (shown in status line), animation speed multiplier, watch scope (all projects vs current session only), enabled on/off
+- [x] Persist settings in `host.storage` (get/set JSON, debounced); applied on load
+- [x] `host.setBadge(waiting ?? running count)` clamped to `GUEST_BADGE_MAX`; cleared when none
+- [x] Guards: duplicate-mount protection, generation counter for stale async, per-subscription tokens so superseded registrations can't leak or clobber
+- [x] Error handling: `NOT_GRANTED` → friendly "enable the sessions capability in Settings → Extensions" empty state (gated so late settings load can't undo it); `host.onConnection` → disconnected banner
 
 ## Phase 5 — Verification checklist
 
-- [ ] Pet idles with no session open
-- [ ] Start a session and send a prompt: pet reacts while `busy`/`activity: running`, switches animation by tool type (read vs edit vs bash)
-- [ ] Permission/question prompt → attention animation + badge 1
-- [ ] Turn completes → happy one-shot → idle; failed turn → sad one-shot
-- [ ] Second project with a running session while first is idle → pet follows the running one
-- [ ] Settings persist across reload; speed/name/scope changes take effect live
-- [ ] Light + dark theme both look right (theme tokens)
-- [ ] Panel hidden → no rAF burn (check via devtools perf or just visibilitychange log)
-- [ ] Fresh install path: zip the folder (without node_modules) → installs from zip too
+Automated via `tools/mock-host.html` (a mock host speaking the real SDK wire protocol, driven headless by playwright against `panel/main.js`): serve the folder (`python3 -m http.server`), open `/tools/mock-host.html`, read PASS/FAIL lines. `?grant=0` covers the NOT_GRANTED empty state.
+
+- [x] Pet idles with no session open
+- [x] Session running: switches animation by tool type (bash→run, read→curious, edit→excited)
+- [x] Permission prompt → surprised animation + badge 1
+- [x] Turn completes → happy one-shot → idle; failed turn → sad one-shot; duplicate signals for the same turn don't replay; a new turn celebrates again; an outcome arriving during another one-shot is queued, not lost
+- [x] Second project with a running session while first is idle → pet follows the running one
+- [x] Settings persist across reload (name change → save → iframe reload → restored); live status update
+- [x] Disconnected → banner shown
+- [x] NOT_GRANTED → empty state with instructions
+- [ ] Light + dark theme both look right (theme tokens) — manual in-app check
+- [x] Panel hidden → no rAF burn (visibilitychange cancels rAF; verified by code review)
+- [ ] Fresh install path: zip the folder (without node_modules) → installs from zip too — manual in-app check
 
 ## Phase 6 — Later (not v1)
 

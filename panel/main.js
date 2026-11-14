@@ -2415,10 +2415,14 @@ ${GUEST_UI_LOOK_CSS}`;
   var OUTCOME_FLASH_MS = 5e3;
   var projects = [];
   var sessionsByProject = /* @__PURE__ */ new Map();
-  var seenOutcome = /* @__PURE__ */ new Map();
-  var outcomeFlash = null;
+  var lastOutcome = /* @__PURE__ */ new Map();
+  var gen = /* @__PURE__ */ new Map();
+  var flashedOutcome = /* @__PURE__ */ new Map();
+  var outcomeQueue = [];
+  var oneshotOrigin = null;
   var openSession = null;
   var settings = { ...DEFAULT_SETTINGS };
+  var settingsLoaded = false;
   var granted = true;
   var connected = true;
   var generation = 0;
@@ -2452,8 +2456,13 @@ ${GUEST_UI_LOOK_CSS}`;
   function spec(name) {
     return anims[name] ?? null;
   }
-  function requestAnim(name, oneshot = false) {
+  var animLog = [];
+  function requestAnim(name, oneshot = false, baseline) {
     if (!spec(name)) name = "idle";
+    animLog.push(`${oneshot ? "1shot:" : ""}${name} (was ${player.name}${player.oneshot ? "*" : ""})`);
+    if (animLog.length > 60) animLog.shift();
+    const wantBaseline = baseline ?? (oneshot ? player.desired : name);
+    player.desired = spec(wantBaseline) ? wantBaseline : "idle";
     if (oneshot) {
       if (player.oneshot && player.name === name) return;
       player.name = name;
@@ -2462,14 +2471,14 @@ ${GUEST_UI_LOOK_CSS}`;
       player.lastSwitch = performance.now();
       return;
     }
-    player.desired = name;
     if (player.oneshot) return;
     if (player.name === name) return;
     const now = performance.now();
-    if (now - player.lastSwitch < MIN_DISPLAY_MS) return;
-    player.name = name;
-    player.frame = 0;
-    player.lastSwitch = now;
+    if (now - player.lastSwitch >= MIN_DISPLAY_MS) {
+      player.name = name;
+      player.frame = 0;
+      player.lastSwitch = now;
+    }
   }
   var rafId = 0;
   var lastTick = 0;
@@ -2478,6 +2487,11 @@ ${GUEST_UI_LOOK_CSS}`;
     if (document.hidden || !settings.enabled || !sheet || !anims[player.name]) {
       lastTick = now;
       return;
+    }
+    if (!player.oneshot && player.name !== player.desired && now - player.lastSwitch >= MIN_DISPLAY_MS) {
+      player.name = player.desired;
+      player.frame = 0;
+      player.lastSwitch = now;
     }
     const current = spec(player.name);
     const fps = Math.max(1, current.fps * settings.speed);
@@ -2493,6 +2507,8 @@ ${GUEST_UI_LOOK_CSS}`;
           player.name = player.desired;
           player.frame = 0;
           player.lastSwitch = now;
+          oneshotOrigin = null;
+          applyDerived();
         }
       }
     }
@@ -2546,18 +2562,7 @@ ${GUEST_UI_LOOK_CSS}`;
   function extractTool(s) {
     const anyS = s;
     if (anyS.tool && typeof anyS.tool.name === "string" && anyS.tool.name) {
-      return { name: anyS.tool.name, target: String(anyS.tool.target ?? "") };
-    }
-    for (let i = s.items.length - 1; i >= 0; i--) {
-      const d = s.items[i]?.data;
-      if (!d || typeof d !== "object") continue;
-      if (typeof d.tool === "string" && d.tool) {
-        const call = d.toolCall;
-        return { name: d.tool, target: String(call?.target ?? d.target ?? "") };
-      }
-      if (d.type === "tool" && typeof d.name === "string" && d.name) {
-        return { name: d.name, target: String(d.target ?? "") };
-      }
+      return { name: anyS.tool.name, target: anyS.tool.target == null ? "" : String(anyS.tool.target) };
     }
     return null;
   }
@@ -2567,6 +2572,37 @@ ${GUEST_UI_LOOK_CSS}`;
   }
   function projectName(projectId) {
     return projects.find((p) => p.id === projectId)?.name ?? projectId;
+  }
+  function pendingOutcome(s) {
+    if (s.outcome !== "completed" && s.outcome !== "failed") return false;
+    if (outcomeQueue.some((q) => q.sessionId === s.id && Date.now() - q.at < OUTCOME_FLASH_MS)) return true;
+    const fl = flashedOutcome.get(s.id);
+    return !fl || fl.gen !== (gen.get(s.id) ?? 0) || fl.outcome !== s.outcome;
+  }
+  function animsReady() {
+    return Object.keys(anims).length > 0;
+  }
+  function findSession(id) {
+    for (const list of sessionsByProject.values()) {
+      const found = list.find((s) => s.id === id);
+      if (found) return found;
+    }
+    return null;
+  }
+  function queueOutcome(sessionId, outcome, force = false) {
+    const g = gen.get(sessionId) ?? 0;
+    if (outcomeQueue.some((q) => q.sessionId === sessionId && q.outcome === outcome && q.gen === g)) return;
+    const fl = flashedOutcome.get(sessionId);
+    if (fl && fl.gen === g && fl.outcome === outcome) return;
+    const last = lastOutcome.get(sessionId);
+    if (!force && last && last.gen === g && last.outcome === outcome) return;
+    outcomeQueue.push({ sessionId, outcome, at: Date.now(), gen: g });
+  }
+  var activeSeen = /* @__PURE__ */ new Map();
+  function bumpGen(sessionId) {
+    const next = (gen.get(sessionId) ?? 0) + 1;
+    gen.set(sessionId, next);
+    outcomeQueue = outcomeQueue.filter((q) => q.sessionId !== sessionId || q.gen >= next);
   }
   function pickSession() {
     const all = [];
@@ -2580,13 +2616,29 @@ ${GUEST_UI_LOOK_CSS}`;
       const open = all.find((s) => s.id === openSession.id);
       if (open && (ACTIVITY_RANK[open.activity] ?? 0) >= ACTIVITY_RANK.retrying) return open;
     }
-    return all.reduce((best, s) => (ACTIVITY_RANK[s.activity] ?? 0) > (ACTIVITY_RANK[best.activity] ?? 0) ? s : best, all[0]);
+    const score = (s) => (ACTIVITY_RANK[s.activity] ?? 0) * 2 + (pendingOutcome(s) ? 1 : 0);
+    return all.reduce((b, s) => score(s) > score(b) ? s : b, all[0]);
   }
   function derive() {
+    const d = deriveState();
+    if (player.oneshot) {
+      return { anim: player.name, oneshot: true, baseline: d.baseline, status: oneshotStatusText(d.status) };
+    }
+    return d;
+  }
+  function oneshotStatusText(fallback) {
+    const name = settings.name.trim() || DEFAULT_SETTINGS.name;
+    const ctx2 = oneshotOrigin ? ` in ${oneshotOrigin.proj}` : "";
+    if (player.name === "happy") return `${name} is happy \u2014 turn done${ctx2}`;
+    if (player.name === "worried") return `${name} is sad \u2014 the turn failed${ctx2}`;
+    if (player.name === "wave") return `${name} waves${oneshotOrigin ? ` at ${oneshotOrigin.agent}${ctx2}` : ""}`;
+    return fallback;
+  }
+  function deriveState() {
     const name = settings.name.trim() || DEFAULT_SETTINGS.name;
     const s = pickSession();
     if (!s) {
-      return { anim: "idle", oneshot: false, status: `${name} is idle` };
+      return { anim: "idle", oneshot: false, baseline: "idle", status: `${name} is idle` };
     }
     const proj = projectName(s.projectId);
     const agent = s.agent ?? "agent";
@@ -2599,40 +2651,40 @@ ${GUEST_UI_LOOK_CSS}`;
         if (/(read|glob|grep|search|list|find|fetch|ls)\b/.test(n)) anim = "curious";
         else if (/(edit|write|patch|apply|replace|multi)/.test(n)) anim = "excited";
         else if (/(bash|shell|exec|terminal|command|run)/.test(n)) anim = "run";
-        return { anim, oneshot: false, status: `${name} is watching ${agent} run${toolText} in ${proj}` };
+        return { anim, oneshot: false, baseline: anim, status: `${name} is watching ${agent} run${toolText} in ${proj}` };
       }
       case "retrying":
-        return { anim: "worried", oneshot: false, status: `${name} is worried \u2014 ${agent} is retrying in ${proj}` };
+        return { anim: "worried", oneshot: false, baseline: "worried", status: `${name} is worried \u2014 ${agent} is retrying in ${proj}` };
       case "waiting-permission":
-        return { anim: "surprised", oneshot: false, status: `${name} needs you \u2014 permission request in ${proj}` };
+        return { anim: "surprised", oneshot: false, baseline: "surprised", status: `${name} needs you \u2014 permission request in ${proj}` };
       case "waiting-question":
-        return { anim: "surprised", oneshot: false, status: `${name} has a question for you in ${proj}` };
+        return { anim: "surprised", oneshot: false, baseline: "surprised", status: `${name} has a question for you in ${proj}` };
       default: {
-        const now = Date.now();
-        if (outcomeFlash && outcomeFlash.sessionId === s.id && now - outcomeFlash.at < OUTCOME_FLASH_MS) {
-          return outcomeFlash.outcome === "failed" ? { anim: "worried", oneshot: true, status: `${name} is sad \u2014 the turn failed in ${proj}` } : { anim: "happy", oneshot: true, status: `${name} is happy \u2014 turn done in ${proj}` };
-        }
-        if (s.outcome === "completed" || s.outcome === "failed") {
-          const seen = seenOutcome.get(s.id);
-          if (seen !== s.outcome) {
-            seenOutcome.set(s.id, s.outcome);
-            outcomeFlash = { sessionId: s.id, outcome: s.outcome, at: now };
-            return s.outcome === "failed" ? { anim: "worried", oneshot: true, status: `${name} is sad \u2014 the turn failed in ${proj}` } : { anim: "happy", oneshot: true, status: `${name} is happy \u2014 turn done in ${proj}` };
-          }
-        }
         const watchingOther = settings.scope === "all" && openSession && s.id !== openSession.id && s.activity === "idle";
-        return {
-          anim: watchingOther ? "glance" : "idle",
-          oneshot: false,
-          status: `${name} is watching ${proj}`
-        };
+        const anim = watchingOther ? "glance" : "idle";
+        return { anim, oneshot: false, baseline: anim, status: `${name} is watching ${proj}` };
       }
     }
   }
   function applyDerived() {
+    if (!granted) return;
     const d = derive();
-    requestAnim(d.anim, d.oneshot);
-    statusEl.textContent = d.status;
+    requestAnim(d.anim, d.oneshot, d.baseline);
+    let status = player.oneshot ? oneshotStatusText(d.status) : d.status;
+    if (!player.oneshot && animsReady() && settingsLoaded) {
+      const now = Date.now();
+      outcomeQueue = outcomeQueue.filter((q2) => now - q2.at < OUTCOME_FLASH_MS && q2.gen === (gen.get(q2.sessionId) ?? 0));
+      const qi = outcomeQueue.findIndex((q2) => settings.scope !== "current" || openSession && q2.sessionId === openSession.id);
+      const q = qi >= 0 ? outcomeQueue.splice(qi, 1)[0] : void 0;
+      if (q) {
+        flashedOutcome.set(q.sessionId, { gen: q.gen, outcome: q.outcome });
+        const s = findSession(q.sessionId);
+        oneshotOrigin = s ? { proj: projectName(s.projectId), agent: s.agent ?? "agent" } : null;
+        requestAnim(q.outcome === "failed" ? "worried" : "happy", true, d.baseline);
+        status = oneshotStatusText(d.status);
+      }
+    }
+    statusEl.textContent = status;
     updateBadge();
   }
   function updateBadge() {
@@ -2650,36 +2702,58 @@ ${GUEST_UI_LOOK_CSS}`;
   }
   var stopProjects = null;
   var sessionStops = /* @__PURE__ */ new Map();
+  var nextSubToken = 0;
+  function projectKnown(projectId) {
+    return projects.some((p) => p.id === projectId);
+  }
   async function subscribeSessions(projectId, owner) {
+    const token = ++nextSubToken;
+    sessionStops.set(projectId, { token, stop: () => {
+    } });
+    const live = () => owner === generation && sessionStops.get(projectId)?.token === token && projectKnown(projectId);
     try {
       const stop = await host.onSessions(projectId, (snap) => {
-        if (owner !== generation) return;
+        if (!live()) return;
         sessionsByProject.set(projectId, snap.sessions);
+        for (const s of snap.sessions) {
+          const active2 = (ACTIVITY_RANK[s.activity] ?? 0) >= ACTIVITY_RANK.retrying;
+          const wasActive = activeSeen.get(s.id) ?? false;
+          if (active2 && !wasActive) bumpGen(s.id);
+          activeSeen.set(s.id, active2);
+          const out = s.outcome === "completed" || s.outcome === "failed" ? s.outcome : null;
+          if (out) queueOutcome(s.id, out);
+          lastOutcome.set(s.id, { gen: gen.get(s.id) ?? 0, outcome: out });
+        }
         applyDerived();
       });
-      if (owner !== generation) {
+      if (!live()) {
         stop();
+        if (sessionStops.get(projectId)?.token === token) {
+          sessionStops.delete(projectId);
+          sessionsByProject.delete(projectId);
+        }
         return;
       }
-      sessionStops.set(projectId, stop);
+      sessionStops.get(projectId).stop = stop;
     } catch (error) {
-      if (error instanceof HostRequestError && error.code === "NOT_GRANTED") {
+      const owned = sessionStops.get(projectId)?.token === token;
+      if (owned) sessionStops.delete(projectId);
+      if (owned && owner === generation && error instanceof HostRequestError && error.code === "NOT_GRANTED") {
         granted = false;
         showPermissionEmpty();
       }
     }
   }
-  async function watchProjects() {
-    const owner = ++generation;
+  async function watchProjects(owner) {
     try {
       const stop = await host.onProjects((snap) => {
         if (owner !== generation) return;
         projects.length = 0;
         projects.push(...snap.projects);
         const ids = new Set(snap.projects.map((p) => p.id));
-        for (const [pid, stopOne] of [...sessionStops]) {
+        for (const [pid, entry] of [...sessionStops]) {
           if (!ids.has(pid)) {
-            stopOne();
+            entry.stop();
             sessionStops.delete(pid);
             sessionsByProject.delete(pid);
           }
@@ -2695,11 +2769,9 @@ ${GUEST_UI_LOOK_CSS}`;
       }
       stopProjects = stop;
     } catch (error) {
-      if (error instanceof HostRequestError && error.code === "NOT_GRANTED") {
+      if (owner === generation && error instanceof HostRequestError && error.code === "NOT_GRANTED") {
         granted = false;
         showPermissionEmpty();
-      } else {
-        throw error;
       }
     }
   }
@@ -2776,12 +2848,13 @@ ${GUEST_UI_LOOK_CSS}`;
         applyDerived();
       }
     });
-    mountSwitch(settingsEl, {
+    const enabledSwitch = mountSwitch(settingsEl, {
       label: "Pet enabled",
       description: "Pause the animation (the panel still watches sessions).",
       checked: settings.enabled,
       onChange: (checked) => {
         settings.enabled = checked;
+        enabledSwitch.update({ checked });
         persistSettings();
         applyDerived();
         if (!checked) {
@@ -2821,9 +2894,8 @@ ${GUEST_UI_LOOK_CSS}`;
     if (owner !== generation) return false;
     sheet = img;
     anims = res;
-    player.name = "idle";
-    player.desired = "idle";
-    player.frame = 0;
+    player.lastSwitch = 0;
+    applyDerived();
     draw();
     return true;
   }
@@ -2834,12 +2906,13 @@ ${GUEST_UI_LOOK_CSS}`;
     mounted = true;
     const owner = ++generation;
     void loadSettings().then(() => {
-      if (owner !== generation) return;
+      if (owner !== generation || !granted) return;
+      settingsLoaded = true;
       mountSettings();
       applyDerived();
     });
     void loadAssets(owner).then((ok) => {
-      if (ok) statusEl.textContent = `${settings.name.trim() || DEFAULT_SETTINGS.name} is idle`;
+      if (ok) draw();
     });
     host.onSession((session) => {
       openSession = session;
@@ -2847,15 +2920,22 @@ ${GUEST_UI_LOOK_CSS}`;
     });
     host.onSessionLifecycle((event) => {
       if (event.phase === "started") {
-        if (!openSession || event.sessionId === openSession.id) {
-          outcomeFlash = null;
+        bumpGen(event.sessionId);
+        activeSeen.set(event.sessionId, true);
+        if (!player.oneshot && settingsLoaded && (settings.scope === "all" || openSession != null && event.sessionId === openSession.id) && animsReady()) {
+          const s = findSession(event.sessionId);
+          oneshotOrigin = s ? { proj: projectName(s.projectId), agent: s.agent ?? "agent" } : null;
           requestAnim("wave", true);
         }
       } else {
-        outcomeFlash = { sessionId: event.sessionId, outcome: event.phase === "failure" ? "failed" : "completed", at: Date.now() };
-        seenOutcome.set(event.sessionId, outcomeFlash.outcome);
-        if (!openSession || event.sessionId === openSession.id) {
-          requestAnim(event.phase === "failure" ? "worried" : "happy", true);
+        const outcome = event.phase === "failure" ? "failed" : "completed";
+        const g = gen.get(event.sessionId) ?? 0;
+        const fl = flashedOutcome.get(event.sessionId);
+        const already = fl && fl.gen === g || outcomeQueue.some((q) => q.sessionId === event.sessionId && q.gen === g);
+        if (!already) {
+          outcomeQueue = outcomeQueue.filter((q) => !(q.sessionId === event.sessionId && q.gen === g));
+          lastOutcome.set(event.sessionId, { gen: g, outcome });
+          queueOutcome(event.sessionId, outcome, true);
         }
       }
       applyDerived();
@@ -2864,7 +2944,29 @@ ${GUEST_UI_LOOK_CSS}`;
       connected = connection.connected;
       showConnectionBanner(connected);
     });
-    if (granted) void watchProjects();
+    if (granted) void watchProjects(owner);
     startLoop();
   });
+  window.__pet = {
+    player,
+    get settings() {
+      return { ...settings };
+    },
+    derive,
+    get outcomeQueue() {
+      return outcomeQueue.map((q) => ({ ...q }));
+    },
+    get flashed() {
+      return [...flashedOutcome.entries()];
+    },
+    get gen() {
+      return [...gen.entries()];
+    },
+    get lastOutcome() {
+      return [...lastOutcome.entries()];
+    },
+    get animLog() {
+      return [...animLog];
+    }
+  };
 })();

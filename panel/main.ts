@@ -58,10 +58,17 @@ const OUTCOME_FLASH_MS = 5000; // happy/sad one-shot window after a turn ends
 
 const projects: GuestProject[] = [];
 const sessionsByProject = new Map<string, GuestSessionRecord[]>();
-const seenOutcome = new Map<string, string>();
-let outcomeFlash: { sessionId: string; outcome: string; at: number } | null = null;
+type Outcome = 'completed' | 'failed';
+const lastOutcome = new Map<string, { gen: number; outcome: Outcome | null }>();
+const gen = new Map<string, number>();                 // per-session turn generation, bumped on 'started' / active edge
+type Flashed = { gen: number; outcome: Outcome };
+const flashedOutcome = new Map<string, Flashed>();      // last outcome actually played per session
+type QueuedOutcome = { sessionId: string; outcome: Outcome; at: number; gen: number };
+let outcomeQueue: QueuedOutcome[] = []; // marked flashed only when its one-shot actually starts
+let oneshotOrigin: { proj: string; agent: string } | null = null; // context of the playing one-shot
 let openSession: SessionSnapshot | null = null;
 let settings: PetSettings = { ...DEFAULT_SETTINGS };
+let settingsLoaded = false; // outcome playback waits for persisted settings (scope)
 let granted = true; // sessions capability available
 let connected = true;
 let generation = 0; // stale async responses must not paint over newer state
@@ -106,8 +113,13 @@ function spec(name: string): AnimSpec | null {
   return anims[name] ?? null;
 }
 
-function requestAnim(name: string, oneshot = false) {
+const animLog: string[] = []; // TEMP debug
+function requestAnim(name: string, oneshot = false, baseline?: string) {
   if (!spec(name)) name = 'idle';
+  animLog.push(`${oneshot ? '1shot:' : ''}${name} (was ${player.name}${player.oneshot ? '*' : ''})`);
+  if (animLog.length > 60) animLog.shift();
+  const wantBaseline = baseline ?? (oneshot ? player.desired : name);
+  player.desired = spec(wantBaseline) ? wantBaseline : 'idle';
   if (oneshot) {
     if (player.oneshot && player.name === name) return;
     player.name = name;
@@ -116,14 +128,15 @@ function requestAnim(name: string, oneshot = false) {
     player.lastSwitch = performance.now();
     return;
   }
-  player.desired = name;
   if (player.oneshot) return; // let the one-shot finish first
   if (player.name === name) return;
   const now = performance.now();
-  if (now - player.lastSwitch < MIN_DISPLAY_MS) return; // hold the current loop a little longer
-  player.name = name;
-  player.frame = 0;
-  player.lastSwitch = now;
+  if (now - player.lastSwitch >= MIN_DISPLAY_MS) {
+    player.name = name;
+    player.frame = 0;
+    player.lastSwitch = now;
+  }
+  // else: tick() applies player.desired once the hold expires
 }
 
 let rafId = 0;
@@ -134,6 +147,12 @@ function tick(now: number) {
   if (document.hidden || !settings.enabled || !sheet || !anims[player.name]) {
     lastTick = now;
     return;
+  }
+  // retry a deferred loop transition once the minimum display time has passed
+  if (!player.oneshot && player.name !== player.desired && now - player.lastSwitch >= MIN_DISPLAY_MS) {
+    player.name = player.desired;
+    player.frame = 0;
+    player.lastSwitch = now;
   }
   const current = spec(player.name)!;
   const fps = Math.max(1, current.fps * settings.speed);
@@ -150,6 +169,8 @@ function tick(now: number) {
         player.name = player.desired;
         player.frame = 0;
         player.lastSwitch = now;
+        oneshotOrigin = null;
+        applyDerived(); // refresh the status line and pump any queued outcome
       }
     }
   }
@@ -210,22 +231,15 @@ document.addEventListener('visibilitychange', () => {
 
 type ToolRef = { name: string; target: string };
 
-/** Best-effort current tool of a running session (field may vary by host version). */
+/**
+ * Current tool of a running session. The `tool` field is present on hosts
+ * newer than SDK 2.7.0 and absent on older ones — read it defensively and
+ * fall back to a generic "working" animation when the host does not provide it.
+ */
 function extractTool(s: GuestSessionRecord): ToolRef | null {
-  const anyS = s as unknown as { tool?: { name?: unknown; target?: unknown } };
+  const anyS = s as unknown as { tool?: { name?: unknown; target?: unknown } | null };
   if (anyS.tool && typeof anyS.tool.name === 'string' && anyS.tool.name) {
-    return { name: anyS.tool.name, target: String(anyS.tool.target ?? '') };
-  }
-  for (let i = s.items.length - 1; i >= 0; i--) {
-    const d = s.items[i]?.data as Record<string, unknown> | undefined;
-    if (!d || typeof d !== 'object') continue;
-    if (typeof d.tool === 'string' && d.tool) {
-      const call = d.toolCall as Record<string, unknown> | undefined;
-      return { name: d.tool, target: String(call?.target ?? d.target ?? '') };
-    }
-    if (d.type === 'tool' && typeof d.name === 'string' && d.name) {
-      return { name: d.name, target: String(d.target ?? '') };
-    }
+    return { name: anyS.tool.name, target: anyS.tool.target == null ? '' : String(anyS.tool.target) };
   }
   return null;
 }
@@ -239,6 +253,49 @@ function projectName(projectId: string): string {
   return projects.find((p) => p.id === projectId)?.name ?? projectId;
 }
 
+/** True when this session has a turn outcome that has not been flashed yet. */
+function pendingOutcome(s: GuestSessionRecord): boolean {
+  if (s.outcome !== 'completed' && s.outcome !== 'failed') return false;
+  if (outcomeQueue.some((q) => q.sessionId === s.id && Date.now() - q.at < OUTCOME_FLASH_MS)) return true;
+  const fl = flashedOutcome.get(s.id);
+  return !fl || fl.gen !== (gen.get(s.id) ?? 0) || fl.outcome !== s.outcome;
+}
+
+function animsReady(): boolean {
+  return Object.keys(anims).length > 0;
+}
+
+function findSession(id: string): GuestSessionRecord | null {
+  for (const list of sessionsByProject.values()) {
+    const found = list.find((s) => s.id === id);
+    if (found) return found;
+  }
+  return null;
+}
+
+/**
+ * Queue a turn outcome for a one-shot. Deduped so lifecycle and snapshot signals for
+ * the same turn can't celebrate twice; marked flashed only when playback starts
+ * (applyDerived), so an outcome arriving during another one-shot or before the assets
+ * load is queued, not lost.
+ */
+function queueOutcome(sessionId: string, outcome: Outcome, force = false) {
+  const g = gen.get(sessionId) ?? 0;
+  if (outcomeQueue.some((q) => q.sessionId === sessionId && q.outcome === outcome && q.gen === g)) return;
+  const fl = flashedOutcome.get(sessionId);
+  if (fl && fl.gen === g && fl.outcome === outcome) return; // already celebrated this turn
+  const last = lastOutcome.get(sessionId);
+  if (!force && last && last.gen === g && last.outcome === outcome) return; // stale: same turn, value already seen
+  outcomeQueue.push({ sessionId, outcome, at: Date.now(), gen: g });
+}
+
+const activeSeen = new Map<string, boolean>();
+function bumpGen(sessionId: string) {
+  const next = (gen.get(sessionId) ?? 0) + 1;
+  gen.set(sessionId, next);
+  outcomeQueue = outcomeQueue.filter((q) => q.sessionId !== sessionId || q.gen >= next); // drop prior-turn queued outcomes
+}
+
 function pickSession(): GuestSessionRecord | null {
   const all: GuestSessionRecord[] = [];
   for (const list of sessionsByProject.values()) all.push(...list);
@@ -249,18 +306,43 @@ function pickSession(): GuestSessionRecord | null {
   if (!all.length) return null;
   if (openSession) {
     const open = all.find((s) => s.id === openSession!.id);
-    if (open && (ACTIVITY_RANK[open.activity] ?? 0) >= ACTIVITY_RANK.retrying) return open;
+    if (open && (ACTIVITY_RANK[open.activity] ?? 0) >= ACTIVITY_RANK.retrying) return open; // active open session always wins
   }
-  return all.reduce((best, s) => ((ACTIVITY_RANK[s.activity] ?? 0) > (ACTIVITY_RANK[best.activity] ?? 0) ? s : best), all[0]);
+  // otherwise the most active session wins; an uncelebrated turn outcome breaks idle/unknown ties
+  const score = (s: GuestSessionRecord) => (ACTIVITY_RANK[s.activity] ?? 0) * 2 + (pendingOutcome(s) ? 1 : 0);
+  return all.reduce((b, s) => (score(s) > score(b) ? s : b), all[0]);
 }
 
-type Derived = { anim: string; oneshot: boolean; status: string };
+type Derived = { anim: string; oneshot: boolean; baseline: string; status: string };
 
+/**
+ * While a one-shot (wave/happy/sad) is playing, keep it on screen but report its
+ * own status text; the freshly derived loop becomes the baseline it returns to.
+ */
 function derive(): Derived {
+  const d = deriveState();
+  if (player.oneshot) {
+    // keep the playing one-shot on screen; report its own status using the session
+    // that triggered it (stable even after that session loses the pick)
+    return { anim: player.name, oneshot: true, baseline: d.baseline, status: oneshotStatusText(d.status) };
+  }
+  return d;
+}
+
+function oneshotStatusText(fallback: string): string {
+  const name = settings.name.trim() || DEFAULT_SETTINGS.name;
+  const ctx = oneshotOrigin ? ` in ${oneshotOrigin.proj}` : '';
+  if (player.name === 'happy') return `${name} is happy — turn done${ctx}`;
+  if (player.name === 'worried') return `${name} is sad — the turn failed${ctx}`;
+  if (player.name === 'wave') return `${name} waves${oneshotOrigin ? ` at ${oneshotOrigin.agent}${ctx}` : ''}`;
+  return fallback;
+}
+
+function deriveState(): Derived {
   const name = settings.name.trim() || DEFAULT_SETTINGS.name;
   const s = pickSession();
   if (!s) {
-    return { anim: 'idle', oneshot: false, status: `${name} is idle` };
+    return { anim: 'idle', oneshot: false, baseline: 'idle', status: `${name} is idle` };
   }
   const proj = projectName(s.projectId);
   const agent = s.agent ?? 'agent';
@@ -274,46 +356,45 @@ function derive(): Derived {
       if (/(read|glob|grep|search|list|find|fetch|ls)\b/.test(n)) anim = 'curious';
       else if (/(edit|write|patch|apply|replace|multi)/.test(n)) anim = 'excited';
       else if (/(bash|shell|exec|terminal|command|run)/.test(n)) anim = 'run';
-      return { anim, oneshot: false, status: `${name} is watching ${agent} run${toolText} in ${proj}` };
+      return { anim, oneshot: false, baseline: anim, status: `${name} is watching ${agent} run${toolText} in ${proj}` };
     }
     case 'retrying':
-      return { anim: 'worried', oneshot: false, status: `${name} is worried — ${agent} is retrying in ${proj}` };
+      return { anim: 'worried', oneshot: false, baseline: 'worried', status: `${name} is worried — ${agent} is retrying in ${proj}` };
     case 'waiting-permission':
-      return { anim: 'surprised', oneshot: false, status: `${name} needs you — permission request in ${proj}` };
+      return { anim: 'surprised', oneshot: false, baseline: 'surprised', status: `${name} needs you — permission request in ${proj}` };
     case 'waiting-question':
-      return { anim: 'surprised', oneshot: false, status: `${name} has a question for you in ${proj}` };
+      return { anim: 'surprised', oneshot: false, baseline: 'surprised', status: `${name} has a question for you in ${proj}` };
     default: {
-      // idle / unknown: flash the last turn outcome once, then relax
-      const now = Date.now();
-      if (outcomeFlash && outcomeFlash.sessionId === s.id && now - outcomeFlash.at < OUTCOME_FLASH_MS) {
-        return outcomeFlash.outcome === 'failed'
-          ? { anim: 'worried', oneshot: true, status: `${name} is sad — the turn failed in ${proj}` }
-          : { anim: 'happy', oneshot: true, status: `${name} is happy — turn done in ${proj}` };
-      }
-      if (s.outcome === 'completed' || s.outcome === 'failed') {
-        const seen = seenOutcome.get(s.id);
-        if (seen !== s.outcome) {
-          seenOutcome.set(s.id, s.outcome);
-          outcomeFlash = { sessionId: s.id, outcome: s.outcome, at: now };
-          return s.outcome === 'failed'
-            ? { anim: 'worried', oneshot: true, status: `${name} is sad — the turn failed in ${proj}` }
-            : { anim: 'happy', oneshot: true, status: `${name} is happy — turn done in ${proj}` };
-        }
-      }
+      // idle / unknown: the last turn outcome is queued by the snapshot/lifecycle
+      // signals, never by derivation
       const watchingOther = settings.scope === 'all' && openSession && s.id !== openSession.id && s.activity === 'idle';
-      return {
-        anim: watchingOther ? 'glance' : 'idle',
-        oneshot: false,
-        status: `${name} is watching ${proj}`,
-      };
+      const anim = watchingOther ? 'glance' : 'idle';
+      return { anim, oneshot: false, baseline: anim, status: `${name} is watching ${proj}` };
     }
   }
 }
 
 function applyDerived() {
+  if (!granted) return; // the permission empty state owns the UI until the capability is approved
   const d = derive();
-  requestAnim(d.anim, d.oneshot);
-  statusEl.textContent = d.status;
+  requestAnim(d.anim, d.oneshot, d.baseline);
+  let status = player.oneshot ? oneshotStatusText(d.status) : d.status;
+  // play the oldest queued turn outcome once no one-shot is in flight; only now is it
+  // marked flashed, so it can't be consumed-and-lost while another one-shot plays
+  if (!player.oneshot && animsReady() && settingsLoaded) {
+    const now = Date.now();
+    outcomeQueue = outcomeQueue.filter((q) => now - q.at < OUTCOME_FLASH_MS && q.gen === (gen.get(q.sessionId) ?? 0));
+    const qi = outcomeQueue.findIndex((q) => settings.scope !== 'current' || (openSession && q.sessionId === openSession.id)); // FIX 3: respect watch scope
+    const q = qi >= 0 ? outcomeQueue.splice(qi, 1)[0] : undefined;
+    if (q) {
+      flashedOutcome.set(q.sessionId, { gen: q.gen, outcome: q.outcome });
+      const s = findSession(q.sessionId);
+      oneshotOrigin = s ? { proj: projectName(s.projectId), agent: s.agent ?? 'agent' } : null;
+      requestAnim(q.outcome === 'failed' ? 'worried' : 'happy', true, d.baseline);
+      status = oneshotStatusText(d.status);
+    }
+  }
+  statusEl.textContent = status;
   updateBadge();
 }
 
@@ -335,39 +416,66 @@ function updateBadge() {
 /* ------------------------------------------------------------------ */
 
 let stopProjects: (() => void) | null = null;
-const sessionStops = new Map<string, () => void>();
+const sessionStops = new Map<string, { token: number; stop: () => void }>();
+let nextSubToken = 0;
+
+function projectKnown(projectId: string): boolean {
+  return projects.some((p) => p.id === projectId);
+}
 
 async function subscribeSessions(projectId: string, owner: number) {
+  const token = ++nextSubToken;
+  // reserve now so repeated snapshots can't double-subscribe; the token lets a
+  // superseded registration detect that it lost the slot while its await was pending
+  sessionStops.set(projectId, { token, stop: () => {} });
+  const live = () => owner === generation && sessionStops.get(projectId)?.token === token && projectKnown(projectId);
   try {
     const stop = await host.onSessions(projectId, (snap) => {
-      if (owner !== generation) return;
+      if (!live()) return;
       sessionsByProject.set(projectId, snap.sessions);
+      for (const s of snap.sessions) {
+        const active = (ACTIVITY_RANK[s.activity] ?? 0) >= ACTIVITY_RANK.retrying;
+        const wasActive = activeSeen.get(s.id) ?? false;
+        if (active && !wasActive) bumpGen(s.id); // inactive→active edge = new turn (lifecycle 'started' marks active, so no double bump)
+        activeSeen.set(s.id, active);
+        const out: Outcome | null = s.outcome === 'completed' || s.outcome === 'failed' ? s.outcome : null;
+        if (out) queueOutcome(s.id, out); // queueOutcome's gen-tagged lastOutcome guard suppresses stale cached records
+        lastOutcome.set(s.id, { gen: gen.get(s.id) ?? 0, outcome: out });
+      }
       applyDerived();
     });
-    if (owner !== generation) {
-      stop();
+    if (!live()) {
+      stop(); // superseded while pending — never leak the subscription
+      // only drop the cache if we still own the slot; a replacement subscription may
+      // already have delivered fresh sessions for this project
+      if (sessionStops.get(projectId)?.token === token) {
+        sessionStops.delete(projectId);
+        sessionsByProject.delete(projectId);
+      }
       return;
     }
-    sessionStops.set(projectId, stop);
+    sessionStops.get(projectId)!.stop = stop;
   } catch (error) {
-    if (error instanceof HostRequestError && error.code === 'NOT_GRANTED') {
+    const owned = sessionStops.get(projectId)?.token === token;
+    if (owned) sessionStops.delete(projectId);
+    if (owned && owner === generation && error instanceof HostRequestError && error.code === 'NOT_GRANTED') {
       granted = false;
       showPermissionEmpty();
     }
+    // other subscription errors leave the panel running with what it has
   }
 }
 
-async function watchProjects() {
-  const owner = ++generation;
+async function watchProjects(owner: number) {
   try {
     const stop = await host.onProjects((snap) => {
       if (owner !== generation) return;
       projects.length = 0;
       projects.push(...snap.projects);
       const ids = new Set(snap.projects.map((p) => p.id));
-      for (const [pid, stopOne] of [...sessionStops]) {
+      for (const [pid, entry] of [...sessionStops]) {
         if (!ids.has(pid)) {
-          stopOne();
+          entry.stop();
           sessionStops.delete(pid);
           sessionsByProject.delete(pid);
         }
@@ -383,11 +491,9 @@ async function watchProjects() {
     }
     stopProjects = stop;
   } catch (error) {
-    if (error instanceof HostRequestError && error.code === 'NOT_GRANTED') {
+    if (owner === generation && error instanceof HostRequestError && error.code === 'NOT_GRANTED') {
       granted = false;
       showPermissionEmpty();
-    } else {
-      throw error;
     }
   }
 }
@@ -476,12 +582,13 @@ function mountSettings() {
       applyDerived();
     },
   });
-  mountSwitch(settingsEl, {
+  const enabledSwitch = mountSwitch(settingsEl, {
     label: 'Pet enabled',
     description: 'Pause the animation (the panel still watches sessions).',
     checked: settings.enabled,
     onChange: (checked) => {
       settings.enabled = checked;
+      enabledSwitch.update({ checked });
       persistSettings();
       applyDerived();
       if (!checked) {
@@ -528,9 +635,8 @@ async function loadAssets(owner: number): Promise<boolean> {
   if (owner !== generation) return false; // stale load, a newer one is in flight
   sheet = img;
   anims = res;
-  player.name = 'idle';
-  player.desired = 'idle';
-  player.frame = 0;
+  player.lastSwitch = 0; // allow an immediate switch to whatever the state machine wants now
+  applyDerived(); // don't pin to idle if a session snapshot arrived while assets loaded
   draw();
   return true;
 }
@@ -548,13 +654,14 @@ host.onReady((readyCtx: HostReadyContext) => {
   const owner = ++generation;
 
   void loadSettings().then(() => {
-    if (owner !== generation) return;
+    if (owner !== generation || !granted) return; // don't unhide settings over the permission empty state
+    settingsLoaded = true;
     mountSettings();
     applyDerived();
   });
 
   void loadAssets(owner).then((ok) => {
-    if (ok) statusEl.textContent = `${settings.name.trim() || DEFAULT_SETTINGS.name} is idle`;
+    if (ok) draw();
   });
 
   host.onSession((session) => {
@@ -564,15 +671,22 @@ host.onReady((readyCtx: HostReadyContext) => {
 
   host.onSessionLifecycle((event: SessionLifecycleEvent) => {
     if (event.phase === 'started') {
-      if (!openSession || event.sessionId === openSession.id) {
-        outcomeFlash = null;
+      bumpGen(event.sessionId);
+      activeSeen.set(event.sessionId, true);
+      if (!player.oneshot && settingsLoaded && (settings.scope === 'all' || (openSession != null && event.sessionId === openSession.id)) && animsReady()) {
+        const s = findSession(event.sessionId);
+        oneshotOrigin = s ? { proj: projectName(s.projectId), agent: s.agent ?? 'agent' } : null;
         requestAnim('wave', true);
       }
     } else {
-      outcomeFlash = { sessionId: event.sessionId, outcome: event.phase === 'failure' ? 'failed' : 'completed', at: Date.now() };
-      seenOutcome.set(event.sessionId, outcomeFlash.outcome);
-      if (!openSession || event.sessionId === openSession.id) {
-        requestAnim(event.phase === 'failure' ? 'worried' : 'happy', true);
+      const outcome: Outcome = event.phase === 'failure' ? 'failed' : 'completed';
+      const g = gen.get(event.sessionId) ?? 0;
+      const fl = flashedOutcome.get(event.sessionId);
+      const already = (fl && fl.gen === g) || outcomeQueue.some((q) => q.sessionId === event.sessionId && q.gen === g);
+      if (!already) {
+        outcomeQueue = outcomeQueue.filter((q) => !(q.sessionId === event.sessionId && q.gen === g));
+        lastOutcome.set(event.sessionId, { gen: g, outcome });
+        queueOutcome(event.sessionId, outcome, true);
       }
     }
     applyDerived();
@@ -583,7 +697,19 @@ host.onReady((readyCtx: HostReadyContext) => {
     showConnectionBanner(connected);
   });
 
-  if (granted) void watchProjects();
+  if (granted) void watchProjects(owner);
 
   startLoop();
 });
+
+// Debug/verification handle (the sandboxed panel exposes nothing otherwise).
+(window as unknown as { __pet?: unknown }).__pet = {
+  player,
+  get settings() { return { ...settings }; },
+  derive,
+  get outcomeQueue() { return outcomeQueue.map((q) => ({ ...q })); },
+  get flashed() { return [...flashedOutcome.entries()]; },
+  get gen() { return [...gen.entries()]; },
+  get lastOutcome() { return [...lastOutcome.entries()]; },
+  get animLog() { return [...animLog]; },
+};
